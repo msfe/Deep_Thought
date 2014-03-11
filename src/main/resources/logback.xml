@@ -10,7 +10,8 @@
         </encoder>
     </appender>
 
-    <logger name="se" level="DEBUG"/>
+
+    <logger name="se" level="ERROR"/>
     <root level="INFO">
         <appender-ref ref="STDOUT"/>
     </root>

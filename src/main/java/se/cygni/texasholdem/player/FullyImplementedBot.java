@@ -2,6 +2,7 @@ package se.cygni.texasholdem.player;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import se.cygni.texasholdem.client.ClientEventDispatcher;
 import se.cygni.texasholdem.client.CurrentPlayState;
 import se.cygni.texasholdem.client.PlayerClient;
 import se.cygni.texasholdem.communication.message.event.*;
@@ -9,12 +10,11 @@ import se.cygni.texasholdem.communication.message.request.ActionRequest;
 import se.cygni.texasholdem.game.*;
 import se.cygni.texasholdem.game.definitions.PlayState;
 import se.cygni.texasholdem.game.definitions.PokerHand;
+import se.cygni.texasholdem.game.definitions.Rank;
 import se.cygni.texasholdem.game.util.PokerHandUtil;
 
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.PrintWriter;
 import java.util.*;
 
 /**
@@ -45,6 +45,10 @@ public class FullyImplementedBot implements Player {
     private final int NUMBER_OF_PLAYERS_IN_STATISTICS = 11; //Statistics only holds for tables between 2-10 players so slot 0,1 is overhead.
     private int raised;
 
+    ClientEventDispatcher eventDispatcher = new ClientEventDispatcher(this);
+    ClientEventDispatcher currentPlayStateDispatcher;
+    CurrentPlayState currentPlayState;
+
     /**
      * Default constructor for a Java Poker Bot.
      *
@@ -55,6 +59,8 @@ public class FullyImplementedBot implements Player {
         this.serverHost = serverHost;
         this.serverPort = serverPort;
         raised = 0;
+        currentPlayState = new CurrentPlayState(getName());
+        currentPlayStateDispatcher = new ClientEventDispatcher(currentPlayState.getPlayerImpl());
 
         //Load in starting hand statistics
         startingHandsProp = new HashMap[NUMBER_OF_PLAYERS_IN_STATISTICS];
@@ -74,6 +80,15 @@ public class FullyImplementedBot implements Player {
 
         // Initialize the player client
         playerClient = new PlayerClient(this, serverHost, serverPort);
+    }
+
+    public CurrentPlayState getCurrentPlayState() {
+        return currentPlayState;
+    }
+
+    public void dispatchEvent(TexasEvent event) {
+        currentPlayStateDispatcher.onEvent(event);
+        eventDispatcher.onEvent(event);
     }
 
     public void playATrainingGame() throws Exception {
@@ -151,6 +166,7 @@ public class FullyImplementedBot implements Player {
      */
     private Action getBestAction(ActionRequest request) {
 
+
         Action callAction = null;
         Action checkAction = null;
         Action raiseAction = null;
@@ -191,14 +207,83 @@ public class FullyImplementedBot implements Player {
         Hand myBestHand = pokerHandUtil.getBestHand();
         PokerHand myBestPokerHand = myBestHand.getPokerHand();
 
-        if (playState.getCommunityCards().size() == 0) {
-            return evaluateStartingPosition(playState, callAction, checkAction, foldAction, raiseAction, allInAction);
+        log.error(playState.getCurrentPlayState().toString());
+        if (playState.getCurrentPlayState() == PlayState.PRE_FLOP) {
+            return evaluatePreFlop(playState, callAction, checkAction, raiseAction, foldAction, allInAction);
         }
 
-        // Let's go ALL IN if hand is better than or equal to THREE_OF_A_KIND
-        if (allInAction != null && isHandBetterThan(myBestPokerHand, PokerHand.TWO_PAIRS)) {
+        if (playState.getCurrentPlayState() == PlayState.FLOP) {
+            return evaluateFlop(playState, callAction, checkAction, raiseAction, foldAction, allInAction, myBestPokerHand);
+        }
+
+        if (playState.getCurrentPlayState() == PlayState.TURN) {
+            return evaluateTurn(playState, callAction, checkAction, raiseAction, foldAction, allInAction, myBestPokerHand);
+        }
+
+        if (playState.getCurrentPlayState() == PlayState.RIVER) {
+            return evaluateRiver(playState, callAction, checkAction, raiseAction, foldAction, allInAction, myBestPokerHand);
+        }
+
+        // failsafe
+        return foldAction;
+    }
+
+    public Action evaluatePreFlop(CurrentPlayState playState, Action callAction, Action checkAction, Action raiseAction, Action foldAction, Action allInAction) {
+        List<Card> cardsList = playState.getMyCards();
+        String hand = Translator.translateFromShortString(cardsList);
+
+
+        int potentialPlayers = playState.getNumberOfPlayers(); // - playState.getNumberOfFoldedPlayers();
+        Float winProb = (Float) startingHandsProp[potentialPlayers].get(hand);
+        //Better position if we are dealer
+        if (playState.getDealerPlayer().equals(this)) {
+            winProb += 5;
+        }
+
+        //If we have a good hand -> raise
+        if (winProb > 60 && raiseAction != null) {
             raised = 0;
-            return allInAction;
+            return raiseAction;
+        }
+
+        if (getMyCardsTopTenRank(playState) > 0) {
+            log.error("do i ever get here?");
+            if(raiseAction != null ){
+                return raiseAction;
+            }
+            if(callAction != null){
+                return callAction;
+            }
+        }
+        //Check if possible
+        if (checkAction != null) {
+            raised = 0;
+            return checkAction;
+        }
+
+        if (winProb > 15 && callAction != null && (getCallAmount(callAction)<=100)) {
+            return callAction;
+        }
+
+        if (winProb > 22 && callAction != null && (getCallAmount(callAction)<=300)) {
+            return callAction;
+        }
+        if (winProb > 30 && callAction != null && (getCallAmount(callAction)<=1000)) {
+            return callAction;
+        }
+
+
+        //failsafe
+        raised = 0;
+        log.error("folding with " + winProb + "%");
+        return foldAction;
+    }
+
+    private Action evaluateFlop(CurrentPlayState playState, Action callAction, Action checkAction, Action raiseAction, Action foldAction, Action allInAction, PokerHand myBestPokerHand) {
+        if (raiseAction != null && (
+                (myBestPokerHand.getOrderValue() >= 3) ||
+                        (getMyCardsTopTenRank(playState) > 5))) {
+            return raiseAction;
         }
 
         // Otherwise, be more careful CHECK if possible.
@@ -206,10 +291,6 @@ public class FullyImplementedBot implements Player {
             raised = 0;
             return checkAction;
         }
-
-        // Okay, we have either CALL or RAISE left
-        long callAmount = callAction == null ? -1 : callAction.getAmount();
-        long raiseAmount = raiseAction == null ? -1 : raiseAction.getAmount();
 
         // Only call if ONE_PAIR or better
         if (isHandBetterThan(myBestPokerHand, PokerHand.ONE_PAIR) && callAction != null) {
@@ -235,42 +316,12 @@ public class FullyImplementedBot implements Player {
         return foldAction;
     }
 
-    public Action evaluateStartingPosition(CurrentPlayState playState, Action callAction, Action checkAction, Action raiseAction, Action foldAction, Action allInAction) {
-        List<Card> cardsList = playState.getMyCards();
-        String hand = Translator.translateFromShortString(cardsList);
+    private Action evaluateTurn(CurrentPlayState playState, Action callAction, Action checkAction, Action raiseAction, Action foldAction, Action allInAction, PokerHand myBestPokerHand) {
+        return evaluateFlop(playState,callAction,checkAction,raiseAction,foldAction,allInAction,myBestPokerHand);
+    }
 
-
-        int potentialPlayers = playState.getNumberOfPlayers() - playState.getNumberOfFoldedPlayers();
-        Float winProb = (Float) startingHandsProp[potentialPlayers].get(hand);
-        //Better position if we are dealer
-        if (playState.getDealerPlayer().equals(this)) {
-            winProb += 5;
-        }
-
-        //If we have a good hand -> raise
-        if (winProb > 50 && raiseAction != null) {
-            raised = 0;
-            return raiseAction;
-        }
-
-        //Check if possible
-        if (checkAction != null) {
-            raised = 0;
-            return checkAction;
-        }
-
-        //Call if no more than one player have raised before
-        if (winProb > 33 && raised <= 1 && callAction != null) {
-            //If its a very big raise fold anyway. We still hav less then 50% chance to win
-            if(playState.getMyInvestmentInPot()/playState.getPotTotal() < 1/(potentialPlayers+2)){
-                return foldAction;
-            }
-            raised = 0;
-            return callAction;
-        }
-
-        //failsafe
-        return foldAction;
+    private Action evaluateRiver(CurrentPlayState playState, Action callAction, Action checkAction, Action raiseAction, Action foldAction, Action allInAction, PokerHand myBestPokerHand) {
+        return evaluateFlop(playState,callAction,checkAction,raiseAction,foldAction,allInAction,myBestPokerHand);
     }
 
     /**
@@ -282,6 +333,85 @@ public class FullyImplementedBot implements Player {
      */
     private boolean isHandBetterThan(PokerHand myPokerHand, PokerHand otherPokerHand) {
         return myPokerHand.getOrderValue() > otherPokerHand.getOrderValue();
+    }
+
+    /**
+     * @param callAction
+     * @return the cost to call
+     */
+    private long getCallAmount(Action callAction) {
+        return callAction == null ? -1 : callAction.getAmount();
+    }
+
+    /**
+     * @param raiseAction
+     * @return the amount that will be raised
+     */
+    private long getRaiseAmount(Action raiseAction) {
+        return raiseAction == null ? -1 : raiseAction.getAmount();
+    }
+
+    private int getMyCardsTopTenRank(CurrentPlayState currentPlayState) {
+
+        // 10: A - A
+        if (doMyCardsContain(Rank.ACE, Rank.ACE, currentPlayState)) {
+            return 10;
+        }
+
+        //  9: K - K
+        if (doMyCardsContain(Rank.KING, Rank.KING, currentPlayState)) {
+            return 9;
+        }
+
+        //  8: Q - Q
+        if (doMyCardsContain(Rank.QUEEN, Rank.QUEEN, currentPlayState)) {
+            return 8;
+        }
+
+        //  7: A - K
+        if (doMyCardsContain(Rank.ACE, Rank.KING,currentPlayState)) {
+            return 7;
+        }
+
+        //  6: J - J
+        if (doMyCardsContain(Rank.JACK, Rank.JACK, currentPlayState)) {
+            return 6;
+        }
+
+        //  5: 10 - 10
+        if (doMyCardsContain(Rank.TEN, Rank.TEN, currentPlayState)) {
+            return 5;
+        }
+
+        //  4: 9 - 9
+        if (doMyCardsContain(Rank.NINE, Rank.NINE, currentPlayState)) {
+            return 4;
+        }
+
+        //  3: 8 - 8
+        if (doMyCardsContain(Rank.EIGHT, Rank.EIGHT, currentPlayState)) {
+            return 3;
+        }
+
+        //  2: A - Q
+        if (doMyCardsContain(Rank.ACE, Rank.QUEEN, currentPlayState)) {
+            return 2;
+        }
+
+        //  1: 7 - 7
+        if (doMyCardsContain(Rank.SEVEN, Rank.SEVEN, currentPlayState)) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    private boolean doMyCardsContain(Rank rank1, Rank rank2, CurrentPlayState currentPlayState) {
+        Card c1 = currentPlayState.getMyCards().get(0);
+        Card c2 = currentPlayState.getMyCards().get(1);
+
+        return (c1.getRank() == rank1 && c2.getRank() == rank2) ||
+                (c1.getRank() == rank2 && c2.getRank() == rank1);
     }
 
     /**
